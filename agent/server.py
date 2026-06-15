@@ -1,11 +1,3 @@
-"""FastAPI wrapper exposing the agent over HTTP.
-
-Run:
-    uv run uvicorn agent.server:app --host 0.0.0.0 --port 8001
-
-The /answer endpoint accepts {question, db, tags?} and returns the
-agent's final SQL, the result rows, and per-iteration history.
-"""
 from __future__ import annotations
 
 import os
@@ -24,7 +16,7 @@ from agent.graph import AgentState, graph  # noqa: E402
 # produce zero traces.
 _lf_handler: Any = None
 if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
-    from langfuse.langchain import CallbackHandler
+    from langfuse.langchain import CallbackHandler  # v3/v4 import path
 
     _lf_handler = CallbackHandler()
 
@@ -53,14 +45,19 @@ def health() -> dict[str, str]:
 
 
 @app.post("/answer", response_model=AnswerResponse)
-def answer(req: AnswerRequest) -> AnswerResponse:
+async def answer(req: AnswerRequest) -> AnswerResponse:
     state = AgentState(question=req.question, db_id=req.db)
+    # langfuse_tags -> filterable tags in the Langfuse UI; the raw dict is
+    # also kept so individual key/value pairs land in trace metadata.
+    metadata: dict[str, Any] = dict(req.tags)
+    if req.tags:
+        metadata["langfuse_tags"] = [f"{k}:{v}" for k, v in req.tags.items()]
     config: dict[str, Any] = {
         "callbacks": [_lf_handler] if _lf_handler is not None else [],
-        "metadata": req.tags,
+        "metadata": metadata,
     }
     try:
-        final = graph.invoke(state, config=config)
+        final = await graph.ainvoke(state, config=config)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 

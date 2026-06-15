@@ -1,24 +1,10 @@
-"""LangGraph agent: text-to-SQL with verify+revise loop.
-
-Graph shape:
-
-    START -> attach_schema -> generate_sql -> execute -> verify
-                                                          |
-                                              ok=true ----+----> END
-                                                          |
-                                              ok=false ---+----> revise -> execute -> verify (loop)
-
-Loop is capped at MAX_ITERATIONS total generate/revise calls.
-
-The execute node and the graph wiring are provided. `generate_sql_node` is
-filled in as a worked example; you implement `verify`, `revise`, and the
-conditional router following the same shape.
-"""
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -29,13 +15,13 @@ from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema
 
 # Total generate + revise calls before the loop is forced to stop.
-# 3-5 is a reasonable range; tune it as part of Phase 3.
+# 3 = one generate + up to two revises. Raising it buys little quality
+# (per-iteration pass rate flattens) and costs P95 latency; tune with data.
 MAX_ITERATIONS = 3
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
 # vLLM ignores the key, but a hosted OpenAI-compatible provider needs a real one.
-# Lets you point the agent at e.g. OpenAI while iterating without a running vLLM.
 LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "not-needed")
 
 
@@ -54,13 +40,23 @@ class AgentState:
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
-def llm() -> ChatOpenAI:
-    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default)."""
+@lru_cache(maxsize=4)
+def llm(max_tokens: int = 512) -> ChatOpenAI:
+    """Cached chat client pointed at VLLM_BASE_URL.
+
+    Cached (one client per max_tokens value) so every request reuses the
+    same pooled HTTP connections instead of opening a new client per node
+    call. timeout/max_retries are explicit so a wedged backend fails fast
+    instead of silently retrying into the latency budget.
+    """
     return ChatOpenAI(
         model=VLLM_MODEL,
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        max_tokens=max_tokens,
+        timeout=60,
+        max_retries=1,
     )
 
 
@@ -72,26 +68,36 @@ def _attach_schema(state: AgentState) -> dict:
 
 
 def _extract_sql(text: str) -> str:
-    """Pull a SQL statement out of an LLM reply, stripping markdown fences/prose.
-
-    Intentionally simple: take the first ```sql ... ``` block if there is one,
-    otherwise the whole reply. You may need to harden this for your prompts.
-    """
-    fenced = re.search(r"```(?:sql)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    """Pull a SQL statement out of an LLM reply, stripping markdown fences/prose."""
+    fenced = re.search(r"```(?:sql)?\s*(.*?)```",
+                       text, re.DOTALL | re.IGNORECASE)
     return (fenced.group(1) if fenced else text).strip()
 
 
-def generate_sql_node(state: AgentState) -> dict:
+def _parse_verify_reply(text: str) -> tuple[bool, str]:
+    """Defensively parse {"ok": bool, "issue": str} out of an LLM reply.
+
+    Fail OPEN (ok=True) on unparseable output: a broken verifier should not
+    burn extra revise iterations (and latency) on every request. The parse
+    failure is recorded in `issue` so it shows up in Langfuse traces.
+    """
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return True, "verify_parse_failed: no JSON object in reply"
+    try:
+        obj = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return True, "verify_parse_failed: invalid JSON"
+    return bool(obj.get("ok", True)), str(obj.get("issue", "")).strip()
+
+
+async def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
-    Build messages from the prompts, call the shared llm(), extract the SQL,
-    and return only the state fields you changed. `iteration` is bumped here
-    (and in revise) so route_after_verify can enforce MAX_ITERATIONS.
-
-    This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
-    in prompts.py to make it produce real queries.
+    Async so the FastAPI server can run many agent graphs concurrently on
+    one event loop (see module docstring, change #2).
     """
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
@@ -107,46 +113,81 @@ def generate_sql_node(state: AgentState) -> dict:
 
 
 def execute_node(state: AgentState) -> dict:
-    """Provided. Runs the SQL and stores the result."""
+    """Provided. Runs the SQL and stores the result.
+
+    Left sync on purpose: sqlite on local disk over small BIRD DBs is
+    fast, and LangGraph runs sync nodes in a worker thread under ainvoke.
+    """
     return {"execution": execute_sql(state.db_id, state.sql)}
 
 
-def verify_node(state: AgentState) -> dict:
+async def verify_node(state: AgentState) -> dict:
     """Decide whether state.execution plausibly answers state.question.
 
-    Follow the generate_sql_node pattern: build messages from the VERIFY_*
-    prompts, call llm(), parse the reply. Ask the model for a small JSON object
-    like {"ok": bool, "issue": str} and parse it defensively - the model may
-    wrap it in prose or fences. state.execution.render() gives you a compact
-    view of the rows or error to feed into the prompt.
+    Asks the model for {"ok": bool, "issue": str}; parsed defensively by
+    _parse_verify_reply. The verifier sees the question, the SQL, and the
+    compact execution rendering (rows / 0 rows / ERROR), so it can catch
+    the three target failure cases from the README: SQL errored, zero rows
+    when rows are implied, and columns that don't answer the question.
 
-    Return: {"verify_ok": <bool>, "verify_issue": <str>}.
-    What counts as "not plausible" is yours to define - see the Phase 3 targets
-    in the README.
+    max_tokens=160: the reply is a one-line JSON object; capping it keeps
+    the per-request decode budget (and P95) down.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    rendered = state.execution.render() if state.execution else "NO EXECUTION RESULT"
+    response = await llm(max_tokens=160).ainvoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            question=state.question,
+            sql=state.sql,
+            result=rendered,
+        )),
+    ])
+    ok, issue = _parse_verify_reply(response.content)
+    return {
+        "verify_ok": ok,
+        "verify_issue": issue,
+        "history": state.history + [{"node": "verify", "ok": ok, "issue": issue}],
+    }
 
 
-def revise_node(state: AgentState) -> dict:
+async def revise_node(state: AgentState) -> dict:
     """Produce a revised SQL query given state.verify_issue and the prior attempt.
 
-    Same shape as generate_sql_node, but the prompt should include the failing
-    SQL, its execution result, and the verifier's complaint so the model can fix
-    it. Bump the iteration counter the same way generate_sql_node does so the
-    loop terminates.
-
-    Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
+    Same shape as generate_sql_node; the prompt additionally carries the
+    failing SQL, its execution result, and the verifier's complaint.
+    Bumps `iteration` so route_after_verify can enforce MAX_ITERATIONS,
+    and appends to history so the eval runner can score every attempt
+    (per-iteration pass rate, Phase 5).
     """
-    raise NotImplementedError("Implement in Phase 3")
+    rendered = state.execution.render() if state.execution else "NO EXECUTION RESULT"
+    response = await llm().ainvoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            sql=state.sql,
+            result=rendered,
+            issue=state.verify_issue or "(verifier gave no detail)",
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [{"node": "revise", "sql": sql}],
+    }
 
 
 def route_after_verify(state: AgentState) -> str:
     """Conditional router: return "revise" to loop, "end" to terminate.
 
-    Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
-    the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
+    End when the verifier is satisfied OR the generate/revise budget is
+    spent. iteration counts LLM *SQL-producing* calls (generate=1, each
+    revise +1), so MAX_ITERATIONS=3 means at most 2 revise passes.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok or state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------
