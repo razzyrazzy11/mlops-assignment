@@ -41,13 +41,13 @@ question asks) since the Phase 5 eval compares executed row sets.
 ## 4. Tracing (Phase 4)
 
 Langfuse captures every agent run as a LangGraph trace with the full nested-span waterfall 
-— `attach_schema -> generate_sql -> execute -> verify -> revise -> execute -> verify` — each 
+- `attach_schema -> generate_sql -> execute -> verify -> revise -> execute -> verify` - each 
 span carrying its prompt, model response, latency, and token counts (e.g. the verifier span: 351->23 tokens, 0.17 s). 
 Tracing is wired through the langfuse v4 `CallbackHandler` (`from langfuse.langchain import CallbackHandler` in `agent/server.py`); 
 the README's `langfuse.callback` snippet is the v2 API and would not import against the pinned langfuse 4.7.1, so it was not used. 
 A trace of the "average number of crimes committed in 1995..." question (db `financial`) demonstrates the verify->revise loop earning its 
 place: the first generated SQL returned 0 rows, the verifier rejected it (`ok=false`, "0 rows were returned but the question clearly implies 
-matching rows exist"), and the agent revised twice before terminating — captured in `screenshots/langfuse_trace.png`. 
+matching rows exist"), and the agent revised twice before terminating - captured in `screenshots/langfuse_trace.png`. 
 Per-request `tags` are forwarded by the server as a Langfuse `langfuse_tags` list (not merely run metadata), 
 so the trace list is filterable by run label rather than requiring a free-text metadata search. 
 `screenshots/langfuse_tags.png` shows the list filtered to `run:phase4-demo`. 
