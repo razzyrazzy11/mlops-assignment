@@ -55,3 +55,73 @@ Both runners expose a `--tag` flag (`run_eval.py --tag eval-baseline`, `driver.p
 per iteration and the slow requests from a specific run inspected directly.
 
 
+## 5. Evals (Phase 5)
+
+Run: 30-question BIRD-style set, agent serving Qwen3-30B via vLLM, full
+Langfuse trace capture. Wall clock 29.1s. Output: results/eval_baseline.json.
+
+Headline numbers:
+  - Execution accuracy (final):  0.3667  (11/30)
+  - Pass rate by iteration:      [0.3667, 0.3667, 0.3667]
+  - Questions triggering revise: 9 / 30
+  - Mean attempts per question:  1.533  (across all 30)
+  - Agent errors / gold failures: 0 / 0
+
+Finding: the revise loop runs but never converts a wrong answer to a right
+one - and most of the time it does nothing at all. The per-iteration curve
+is flat because revising 9 questions changed zero outcomes. The attempt log
+splits the 30 questions into four buckets:
+
+  - Correct on first pass ............................ 11
+  - Wrong, never revised (accepted silently) ........ 10
+  - Wrong, revised -> identical SQL re-emitted ....... 6
+  - Wrong, revised -> changed but still wrong ........ 3
+
+Two diagnostic points follow:
+
+1. The verifier is not error-driven. Every query executes cleanly
+   (exec_ok = true everywhere), so revise is never triggered by an
+   execution error - only by a result-level check. That check catches
+   just 9 of the 19 wrong answers; the other 10 executable-but-wrong
+   queries pass through unflagged. (Exact trigger condition to be
+   confirmed against the verifier in agent/graph.py.)
+
+2. When revise does fire, it has no correctness signal to act on. There
+   is no gold comparison and no error message fed back, so the prompt can
+   only say "try again." In 6 of 9 cases the model re-emitted the
+   identical query (e.g. the Art-and-Design-students question regenerated
+   the same SQL three times). In the 3 cases where it changed the SQL,
+   the edits were plausible but blind: the Hamilton lap-time query
+   switched time parsing from H:M:S to M:S; the mythic-gladiator query
+   changed format = 'gladiator' to 'Gladiator' - a correct guess that
+   casing might be the bug, but still wrong. The loop can reason; it
+   cannot converge without feedback.
+
+Where the accuracy ceiling sits: the misses are generation-time grounding
+errors, not loop failures - value/encoding mismatches ('Cl' vs 'Chlorine',
+format casing), guessed "normal" thresholds (IgG <= 100, UA <= 7.0),
+join-cardinality inflation, and semantic misreadings (counting not-finished
+races as disqualified). A result-aware verifier (gold-output comparison or
+self-consistency / schema grounding) would make the revise signal correlate
+with correctness rather than non-emptiness - the single change most likely
+to move the curve. (Out of scope for this phase.)
+
+Monitoring during the eval: screenshots/grafana_eval_run.png shows the vLLM
+serving dashboard tracking the pipeline end-to-end while the eval is in
+flight (Last 5 min, 5s refresh). The 29s run appears as the burst at
+~15:30:45-15:32:00, and Requests running peaks at 1 - confirming serial
+execution, consistent with ~1 q/s for 30 questions in 29s.
+
+  - Latency: E2E p50 ~300ms, p95/p99 ~470-500ms; TTFT p50/p95 ~15-19ms;
+    queue p95 ~270ms. End-to-end time is dominated by queueing, not
+    first-token compute - expected for short serial requests.
+  - Throughput: finished rate rises to several req/s; prompt-token
+    throughput peaks ~3K tok/s against low generation-token throughput,
+    consistent with text-to-SQL (long schema prompt, short completion).
+  - KV cache: usage ~0%, preemptions 0. At concurrency 1 the cache is
+    barely touched - healthy headroom, no eviction.
+  - Prefix cache hit rate ~100% once traffic starts - the shared schema /
+    system prefix across all 30 questions is being reused as intended.
+
+Artifacts: results/eval_baseline.json, screenshots/grafana_eval_run.png,
+Langfuse traces tagged run:phase4-demo.
