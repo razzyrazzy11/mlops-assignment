@@ -4,7 +4,8 @@ import os
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 load_dotenv()
@@ -22,7 +23,10 @@ if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY
 
 
 app = FastAPI()
-
+@app.exception_handler(Exception)
+async def all_exceptions(request: Request, exc: Exception):
+    import traceback; traceback.print_exc()
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
 
 class AnswerRequest(BaseModel):
     question: str
@@ -59,6 +63,7 @@ async def answer(req: AnswerRequest) -> AnswerResponse:
     try:
         final = await graph.ainvoke(state, config=config)
     except Exception as e:  # noqa: BLE001
+        import traceback; traceback.print_exc() 
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
     sql = final.get("sql", "")
